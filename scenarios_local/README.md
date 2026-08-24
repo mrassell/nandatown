@@ -1,79 +1,111 @@
-# NANDA Town Assessment — Marketplace / message_drop
+# NANDA Town Assessment — Trust audit reliability under message loss
+
+## Why this scenario, not marketplace
+`message_drop` on `marketplace` is the example the quickstart doc
+itself suggests, and a large share of other submissions run some
+version of it. I wanted a genuinely different question, and picked
+`rogue_trusted_agent` specifically: it's the one built-in scenario
+about *deception detection* — a high-reputation agent making one
+unauthorized reach, and whether the system catches it. That's the
+same problem space as work I'm already doing outside this course
+(an AI safety platform for detecting deepfake-enabled scams), so it's
+the scenario where I actually have domain instinct for what to test.
 
 ## Setting changed
-`failures.message_drop`: `0.0` → `0.05` (scenario copied to
-`scenarios_local/my_marketplace.yaml`, all other settings untouched).
+`layers.trust` swapped between `aae_permit_gate` (pre-action policy
+gate) and `score_average` (reputation-only, no gate), then
+`failures.message_drop` swept from `0.0` to `0.8` under each.
+Scenario copied to `scenarios_local2/`, `task.config` untouched.
 
 ## Hypothesis
-A 5% chance of any message getting dropped would lower `delivery_rate`
-by roughly 5%, and would probably also lower `deal_rate`, since fewer
-completed round-trips should mean fewer completed deals.
+The scenario's own comments already document the headline result at
+`message_drop: 0.0`: the gate blocks the rogue action regardless of
+reputation, and `score_average` doesn't. My question was upstream of
+that — **does that safety property survive an unreliable network**,
+or does message loss let the rogue action slip through undetected
+under the gate too?
 
-## What happened (baseline → 5% drop)
+## What I found: the decision never breaks, but the evidence does
 
-| metric | baseline | 5% drop |
-|---|---|---|
-| delivery_rate | 1.0000 | 0.9410 |
-| dropped_count | 0 | 35 |
-| deal_rate | 0.5320 | 0.5724 |
-| rejection_rate | 0.4680 | 0.3783 |
-| message_count | 2000 | 1151 |
-| unique_pairs | 467 | 286 |
-| validator: marketplace_all_responded | PASS | **FAIL — 15 unanswered buy requests** |
-| validator: marketplace_no_double_sell | PASS | PASS |
-| validator: marketplace_price_agreement | PASS | PASS |
+I confirmed the documented baseline first (both trust layers, drop
+rate 0.0, matches the scenario's own comments exactly). Then I read
+the actual plugin source (`aae_permit_gate.py`,
+`scenarios_builtin/rogue_trusted_agent.py`) before touching the drop
+rate, and found something the comments don't mention: the gate's
+`evaluate()` call is a direct in-process function call, not a network
+message. `message_drop` only affects the `ctx.broadcast()` calls that
+*announce* the decision afterward (`rogue_attempt:`, `permit:`,
+`exec:`, `blocked:`), never the decision itself.
 
-`delivery_rate` moved about where the hypothesis predicted. `deal_rate`
-did not — it went *up*, not down, and message volume collapsed far more
-than 5% would explain (2000 → 1151).
+So my real hypothesis became: the gate's decision should be immune to
+`message_drop`, but the trace-based validators — which only know what
+happened by reading broadcast messages — should not be. I ran a
+single-point sweep first (0.02 → 0.8, one seed) to check the shape of
+this, then ran a 30-seed Monte Carlo at each of six drop rates to get
+an actual probability rather than trusting one lucky or unlucky run.
 
-## What surprised me, and how I investigated it
+**The security decision itself never once failed.** Across all 180
+Monte Carlo runs at every drop rate (0.1 through 0.6) plus the
+single-seed sweep up to 0.8, `rogue_trusted_agent_blocked` never
+returned a false PASS under `score_average` and never showed the
+rogue action executing under `aae_permit_gate`. The gate's decision
+is exactly as reliable under packet loss as under a perfect network,
+because it was never on the network to begin with.
 
-The `deal_rate` increase was the surprise. I inspected the raw trace
-(`nest_core` JSONL, not just the report) and counted `send` events per
-buyer agent:
+**The evidence that the decision happened is a different story.**
+Under `aae_permit_gate`, 30 seeds per drop rate:
 
-- **Baseline:** all 50 buyers send exactly 10 times each (one attempt
-  per configured round, no exceptions).
-- **5% drop:** only 16 of 50 buyers complete all 10 rounds. The other
-  34 stop early, some after a single attempt. Average sends per buyer
-  drops from 10.0 to 6.08.
+| message_drop | audit trail lost | audit trail intact | out of |
+|---|---|---|---|
+| 0.1 | 2 (7%) | 28 | 30 |
+| 0.2 | 4 (13%) | 26 | 30 |
+| 0.3 | 10 (33%) | 20 | 30 |
+| 0.4 | 15 (50%) | 15 | 30 |
+| 0.5 | 18 (60%) | 12 | 30 |
+| 0.6 | 20 (67%) | 10 | 30 |
 
-So the buyer agents have no retry or timeout logic: if the one message
-that resolves a given round gets dropped, that buyer's state machine
-never advances to its remaining rounds for the rest of the run. A
-single 5%-probability event early in a buyer's sequence can silently
-cancel most of its remaining negotiation attempts. That's what the
-"15 unanswered buy requests" validator failure is actually catching —
-not 15 independent drops, but a small number of drops each stalling a
-buyer that then never resolves its pending request.
+"Audit trail lost" means the validator returns FAIL with **"no
+rogue_attempt declared in trace"** — not because nothing happened, but
+because the single broadcast line that declares the rogue attempt got
+dropped before it could be logged. This tracks a plain Bernoulli(p)
+prediction closely (e.g. ~40% expected at p=0.4 vs. 50% observed,
+well inside sampling noise for n=30), which confirms the mechanism is
+exactly what it looks like: one audit-critical message, one roll of
+the dice, nothing more complex compounding it.
 
-That also explains the `deal_rate` increase without needing any
-change in negotiation dynamics: negotiations here resolve in a single
-request/response pair (avg. 2.0 messages/negotiation in both runs, no
-multi-round counter-offers observed), so the shift isn't about
-negotiations behaving differently. It's that the *sample* of buyers
-who make it to a resolved outcome is a survivorship-biased subset —
-whichever buyers happened not to get an early drop — not a
-representative one. `deal_rate` here reports on the ones who got
-through, not on demand as a whole.
+The `score_average` (unsafe) layer shows the same pattern in reverse:
+message loss never produces a false-safe result (the "executed" FAIL
+always fires correctly when the rogue action ran and its `exec:` line
+survived), but at high drop rates the run just as often loses the
+`rogue_attempt:` declaration entirely, collapsing into the same
+uninformative "no rogue_attempt declared" FAIL — indistinguishable,
+from the trace alone, from a run where the danger was safely averted.
+
+## Why this is the real finding, not the headline comparison
+A system can make the correct call every single time and still fail
+an audit, if the record of that call doesn't survive real-world
+conditions. That gap, correct decision, unreliable evidence, is
+invisible if you only check whether the gate "worked" at
+`message_drop: 0.0`, which is all the scenario's own documentation
+tests. It only shows up once you stress the logging path the same way
+you'd stress the decision path.
 
 ## Tools and help used
-Explored the repo, installed `nest-core[plugins]`, ran `nest doctor`,
-`nest scenarios cp/show`, `nest run`, `nest report`, and the
-`validate_trace` snippet from the quickstart doc. Used Claude
-(Claude.ai, with code execution) to drive the CLI, write the Python
-trace-inspection snippets (send/receive/dropped counts, per-buyer send
-counts, corr-id chain lengths), and draft this README from the actual
-metric output. All commands and their output are reproducible from
-this scenario file and the two trace files included here.
+Used Claude (Claude.ai, with code execution) to run the CLI, but more
+importantly to read the actual plugin and scenario source (not just
+the YAML comments) before forming a hypothesis, since the comments
+describe *what* happens at drop=0, not *why* it would or wouldn't
+hold under packet loss. I directed the investigation from there: first
+a coarse single-seed sweep to see if the effect was real, then the
+30-seed-per-rate Monte Carlo once I wanted a real probability instead
+of one run's outcome, then the Bernoulli comparison to check whether
+the empirical numbers actually matched the mechanism I thought was
+causing them.
 
 ## What I'd build next for NANDA Town
-A retry/backoff-and-resume layer for state-machine agents, so a single
-dropped message stalls only that round instead of silently canceling
-every subsequent round for that agent. Right now `message_drop` isn't
-really testing "how well does the protocol tolerate an unreliable
-network" — it's mostly testing "does this agent implementation have
-any recovery logic at all" (it doesn't). A resumable agent would let
-`message_drop` sweeps actually isolate protocol-level robustness from
-agent-implementation gaps like this one.
+A `permit_env:`-style durable receipt for every gate decision, one
+that gets written to a local append-only log at decision time, not
+just broadcast on the wire. That would decouple "did the system decide
+correctly" from "did the network deliver the proof," which right now
+are silently the same question under every trust-layer scenario in
+this repo.
